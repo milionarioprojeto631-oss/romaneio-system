@@ -1,0 +1,16 @@
+{
+  "name": "romaneio-system",
+  "version": "1.0.0",
+  "description": "Sistema de Conferência Logística por Romaneio",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "openai": "^4.28.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
