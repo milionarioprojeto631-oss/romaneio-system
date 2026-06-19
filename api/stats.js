@@ -4,137 +4,88 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANO
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Método não permitido.' });
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Método não permitido.' });
 
   try {
-    const { envio_id, codigo_barras } = req.body;
-    if (!envio_id || !codigo_barras) {
-      return res.status(400).json({ error: 'envio_id e codigo_barras são obrigatórios.' });
+    const { data: dataParam } = req.query;
+    const hoje = dataParam || new Date().toISOString().split('T')[0];
+
+    // Buscar todos os envios do dia
+    const { data: envios, error: enviosErr } = await supabase
+      .from('envios')
+      .select(`
+        id, status, nome_cliente, nota_fiscal, iniciado_em, concluido_em,
+        itens_envio(quantidade, quantidade_conferida, produto_id)
+      `)
+      .eq('data_envio', hoje);
+    if (enviosErr) throw enviosErr;
+
+    const totalEnvios = envios.length;
+    const concluidos = envios.filter(e => e.status === 'concluido').length;
+    const emConferencia = envios.filter(e => e.status === 'em_conferencia').length;
+    const pendentes = envios.filter(e => e.status === 'pendente').length;
+
+    // Total de itens e SKUs
+    let totalItens = 0;
+    const skusSet = new Set();
+    for (const envio of envios) {
+      for (const item of (envio.itens_envio || [])) {
+        totalItens += item.quantidade_conferida || 0;
+        if (item.produto_id) skusSet.add(item.produto_id);
+      }
     }
 
-    // Buscar produto pelo código de barras
-    const { data: produto, error: prodErr } = await supabase
-      .from('produtos')
-      .select('*')
-      .eq('codigo_barras', codigo_barras)
-      .single();
-
-    if (prodErr || !produto) {
-      await supabase.from('log_bipagem').insert([{
-        envio_id,
-        codigo_barras,
-        resultado: 'erro'
-      }]);
-      return res.status(404).json({
-        ok: false,
-        resultado: 'erro',
-        mensagem: 'Produto não encontrado no cadastro.',
-        codigo_barras
+    // Tempo médio por envio concluído (em minutos)
+    let tempoMedio = null;
+    const enviosConcluidos = envios.filter(e => e.status === 'concluido' && e.iniciado_em && e.concluido_em);
+    if (enviosConcluidos.length > 0) {
+      const tempos = enviosConcluidos.map(e => {
+        const inicio = new Date(e.iniciado_em).getTime();
+        const fim = new Date(e.concluido_em).getTime();
+        return (fim - inicio) / 60000;
       });
+      tempoMedio = Math.round(tempos.reduce((a, b) => a + b, 0) / tempos.length);
     }
 
-    // Verificar se produto pertence ao envio
-    const { data: item, error: itemErr } = await supabase
-      .from('itens_envio')
-      .select('*')
-      .eq('envio_id', envio_id)
-      .eq('produto_id', produto.id)
-      .single();
-
-    if (itemErr || !item) {
-      await supabase.from('log_bipagem').insert([{
-        envio_id,
-        produto_id: produto.id,
-        codigo_barras,
-        resultado: 'erro'
-      }]);
-      return res.json({
-        ok: false,
-        resultado: 'erro',
-        mensagem: `"${produto.descricao}" não pertence a este pedido.`,
-        produto
-      });
+    // Progresso geral do dia
+    let totalPrevisto = 0;
+    let totalConferido = 0;
+    for (const envio of envios) {
+      for (const item of (envio.itens_envio || [])) {
+        totalPrevisto += item.quantidade || 0;
+        totalConferido += item.quantidade_conferida || 0;
+      }
     }
 
-    // Verificar quantidade
-    if (item.quantidade_conferida >= item.quantidade) {
-      await supabase.from('log_bipagem').insert([{
-        envio_id,
-        produto_id: produto.id,
-        codigo_barras,
-        resultado: 'excesso'
-      }]);
-      return res.json({
-        ok: false,
-        resultado: 'excesso',
-        mensagem: `Quantidade excedida para "${produto.descricao}". Esperado: ${item.quantidade}, já bipado: ${item.quantidade_conferida}.`,
-        produto,
-        item
-      });
-    }
-
-    // Incrementar quantidade conferida
-    const novaQtd = item.quantidade_conferida + 1;
-    const { error: updErr } = await supabase
-      .from('itens_envio')
-      .update({ quantidade_conferida: novaQtd })
-      .eq('id', item.id);
-    if (updErr) throw updErr;
-
-    // Log positivo
-    await supabase.from('log_bipagem').insert([{
-      envio_id,
-      produto_id: produto.id,
-      codigo_barras,
-      resultado: 'ok'
-    }]);
-
-    // Verificar se todos os itens foram conferidos
-    const { data: todosItens } = await supabase
-      .from('itens_envio')
-      .select('quantidade, quantidade_conferida')
-      .eq('envio_id', envio_id);
-
-    const concluido = todosItens.every(i =>
-      (i.quantidade_conferida + (item.id === item.id ? 0 : 0)) >= i.quantidade
-      // Recalcular com valor atualizado
-    );
-
-    // Checar novamente com dado fresco
-    const { data: itensAtuais } = await supabase
-      .from('itens_envio')
-      .select('quantidade, quantidade_conferida')
-      .eq('envio_id', envio_id);
-
-    const todosConcluidos = itensAtuais.every(i => i.quantidade_conferida >= i.quantidade);
-
-    if (todosConcluidos) {
-      await supabase.from('envios').update({
-        status: 'concluido',
-        concluido_em: new Date().toISOString()
-      }).eq('id', envio_id);
-    } else {
-      // Marcar como em conferência se ainda não estava
-      await supabase.from('envios').update({ status: 'em_conferencia', iniciado_em: new Date().toISOString() })
-        .eq('id', envio_id).eq('status', 'pendente');
-    }
-
-    const restante = item.quantidade - novaQtd;
     return res.json({
-      ok: true,
-      resultado: 'ok',
-      mensagem: `✓ ${produto.descricao}`,
-      produto,
-      item: { ...item, quantidade_conferida: novaQtd },
-      restante,
-      concluido: todosConcluidos
+      data: hoje,
+      resumo: {
+        total_envios: totalEnvios,
+        concluidos,
+        em_conferencia: emConferencia,
+        pendentes,
+        total_skus: skusSet.size,
+        total_itens_embalados: totalItens,
+        total_previsto: totalPrevisto,
+        total_conferido: totalConferido,
+        percentual: totalPrevisto > 0 ? Math.round((totalConferido / totalPrevisto) * 100) : 0,
+        tempo_medio_minutos: tempoMedio
+      },
+      envios: envios.map(e => ({
+        id: e.id,
+        nome_cliente: e.nome_cliente,
+        nota_fiscal: e.nota_fiscal,
+        status: e.status,
+        total_itens: (e.itens_envio || []).reduce((s, i) => s + i.quantidade, 0),
+        itens_conferidos: (e.itens_envio || []).reduce((s, i) => s + i.quantidade_conferida, 0)
+      }))
     });
 
   } catch (err) {
-    console.error('[bipar]', err);
+    console.error('[stats]', err);
     return res.status(500).json({ error: err.message || 'Erro interno.' });
   }
 }
